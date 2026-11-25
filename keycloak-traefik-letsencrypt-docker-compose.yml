@@ -221,8 +221,8 @@ services:
       - "traefik.http.routers.keycloak.middlewares=keycloak-admin-allowlist,compresstraefik"
       - "traefik.http.middlewares.keycloak-admin-allowlist.ipallowlist.sourcerange=${KEYCLOAK_ADMIN_ALLOWED_IPS:-0.0.0.0/0,::/0}"
       # The public router. $$ is a literal $ for Traefik: a realm name ends at
-      # a slash or at the end of the path, so `company` never matches
-      # `company-test`.
+      # a slash or at the end of the path, so `employee` never matches
+      # `employee-test`.
       - "traefik.http.routers.keycloak-public.rule=Host(`${KEYCLOAK_HOSTNAME}`) && (PathPrefix(`/resources/`) || PathRegexp(`^/([.]well-known/[^/]+/)?realms/(${KEYCLOAK_PUBLIC_REALMS:-[^/]+})(/|$$)`))"
       - "traefik.http.routers.keycloak-public.service=keycloak"
       - "traefik.http.routers.keycloak-public.entrypoints=websecure"

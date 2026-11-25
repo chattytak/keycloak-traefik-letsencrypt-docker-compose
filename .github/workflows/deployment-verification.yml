@@ -449,7 +449,7 @@ jobs:
           KEYCLOAK_ADMIN_PASSWORD=$(openssl rand -base64 24 | tr -d '/+=' | head -c 32)
           KEYCLOAK_HOSTNAME=keycloak.heyvaldemar.net
           KEYCLOAK_ADMIN_HOSTNAME=admin.keycloak.heyvaldemar.net
-          KEYCLOAK_PUBLIC_REALMS=company
+          KEYCLOAK_PUBLIC_REALMS=employee
           KEYCLOAK_ADMIN_ALLOWED_IPS=${TEST_ALLOWED_IP}/32,2001:db8::/48
           KEYCLOAK_BACKUP_INIT_SLEEP=30m
           KEYCLOAK_BACKUP_INTERVAL=24h
@@ -461,10 +461,10 @@ jobs:
       - name: Start up services using Docker Compose
         run: docker compose -f "$DOCKER_COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" up -d --wait --wait-timeout 300
 
-      - name: Separate admin hostname - the public one serves realm company only, the admin one only the allowlist
+      - name: Separate admin hostname - the public one serves realm employee only, the admin one only the allowlist
         run: ./tests/routing.sh --split
 
-      - name: One hostname with the allowlist - realm company for everyone, the rest for the allowlist
+      - name: One hostname with the allowlist - realm employee for everyone, the rest for the allowlist
         run: |
           sed -i '/^KEYCLOAK_ADMIN_HOSTNAME=/d' .env
           docker compose -f "$DOCKER_COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" up -d --wait --wait-timeout 300

@@ -5,8 +5,8 @@
 #   tests/routing.sh              .env leaves KEYCLOAK_ADMIN_HOSTNAME,
 #                                 KEYCLOAK_PUBLIC_REALMS and KEYCLOAK_ADMIN_ALLOWED_IPS
 #                                 unset: one hostname, every path, every source
-#   tests/routing.sh --split      .env sets all three, KEYCLOAK_PUBLIC_REALMS=company
-#   tests/routing.sh --one-host   .env sets KEYCLOAK_PUBLIC_REALMS=company and
+#   tests/routing.sh --split      .env sets all three, KEYCLOAK_PUBLIC_REALMS=employee
+#   tests/routing.sh --one-host   .env sets KEYCLOAK_PUBLIC_REALMS=employee and
 #                                 KEYCLOAK_ADMIN_ALLOWED_IPS, no admin hostname
 #
 # The last two need TEST_ALLOWED_IP and TEST_DENIED_IP: two free addresses on
@@ -14,8 +14,8 @@
 #
 # Requests come from throwaway curl containers on traefik-network, so Traefik
 # sees a known source address, and reach Traefik by its container address with
-# --resolve, so no DNS is needed. The last two create the realms company,
-# customer and company-test and set or clear the master realm's frontend URL,
+# --resolve, so no DNS is needed. The last two create the realms employee,
+# customer and employee-test and set or clear the master realm's frontend URL,
 # the step the README gives: run them on a test stack, never on a deployment.
 #
 # CI runs the first form in deploy-and-test and the other two in their own job.
@@ -53,11 +53,11 @@ case "$MODE" in
     [[ -z "$ADMIN$REALMS$ALLOWED_IPS" ]] || {
       echo "error: the default run needs KEYCLOAK_ADMIN_HOSTNAME, KEYCLOAK_PUBLIC_REALMS and KEYCLOAK_ADMIN_ALLOWED_IPS unset" >&2; exit 1; } ;;
   split)
-    [[ -n "$ADMIN" && "$REALMS" == company && -n "$ALLOWED_IPS" ]] || {
-      echo "error: --split needs KEYCLOAK_ADMIN_HOSTNAME, KEYCLOAK_PUBLIC_REALMS=company and KEYCLOAK_ADMIN_ALLOWED_IPS in .env" >&2; exit 1; } ;;
+    [[ -n "$ADMIN" && "$REALMS" == employee && -n "$ALLOWED_IPS" ]] || {
+      echo "error: --split needs KEYCLOAK_ADMIN_HOSTNAME, KEYCLOAK_PUBLIC_REALMS=employee and KEYCLOAK_ADMIN_ALLOWED_IPS in .env" >&2; exit 1; } ;;
   one-host)
-    [[ -z "$ADMIN" && "$REALMS" == company && -n "$ALLOWED_IPS" ]] || {
-      echo "error: --one-host needs KEYCLOAK_PUBLIC_REALMS=company and KEYCLOAK_ADMIN_ALLOWED_IPS, and no KEYCLOAK_ADMIN_HOSTNAME, in .env" >&2; exit 1; } ;;
+    [[ -z "$ADMIN" && "$REALMS" == employee && -n "$ALLOWED_IPS" ]] || {
+      echo "error: --one-host needs KEYCLOAK_PUBLIC_REALMS=employee and KEYCLOAK_ADMIN_ALLOWED_IPS, and no KEYCLOAK_ADMIN_HOSTNAME, in .env" >&2; exit 1; } ;;
 esac
 if [[ "$MODE" != default ]]; then
   [[ -n "${TEST_ALLOWED_IP:-}" && -n "${TEST_DENIED_IP:-}" ]] || {
@@ -184,30 +184,30 @@ routed() {
   exit 1
 }
 
-# make_realms <client> <host>: company, customer and company-test, through
+# make_realms <client> <host>: employee, customer and employee-test, through
 # the Admin REST API on that host
 make_realms() {
   local tok r st
   tok="$(token "$1" "$2")"
   [[ -n "$tok" ]] || { echo "error: no admin token from https://$2" >&2; exit 1; }
-  for r in company customer company-test; do
+  for r in employee customer employee-test; do
     st="$(bearer "$1" "$tok" -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
       -d "{\"realm\":\"$r\",\"enabled\":true}" "https://$2/admin/realms")"
     [[ "$st" == 201 || "$st" == 409 ]] || { echo "error: creating realm $r returned $st" >&2; exit 1; }
   done
-  echo "realms company, customer and company-test exist"
+  echo "realms employee, customer and employee-test exist"
 }
 
-# public_company <client>: what applications need of the realm company,
+# public_employee <client>: what applications need of the realm employee,
 # from a source the allowlist does not name
-public_company() {
+public_employee() {
   local page form css
-  expect "$1" 200 "https://$PUBLIC/realms/company/.well-known/openid-configuration" "company discovery"
-  expect "$1" 200 "https://$PUBLIC/.well-known/oauth-authorization-server/realms/company" "company RFC 8414 discovery"
-  same "$(issuer "$1" "https://$PUBLIC/realms/company/.well-known/openid-configuration")" "https://$PUBLIC/realms/company" "company issuer"
-  page="$(c "$1" "https://$PUBLIC/realms/company/protocol/openid-connect/auth?client_id=account-console&redirect_uri=https%3A%2F%2F$PUBLIC%2Frealms%2Fcompany%2Faccount%2F&response_type=code&scope=openid&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256" || true)"
+  expect "$1" 200 "https://$PUBLIC/realms/employee/.well-known/openid-configuration" "employee discovery"
+  expect "$1" 200 "https://$PUBLIC/.well-known/oauth-authorization-server/realms/employee" "employee RFC 8414 discovery"
+  same "$(issuer "$1" "https://$PUBLIC/realms/employee/.well-known/openid-configuration")" "https://$PUBLIC/realms/employee" "employee issuer"
+  page="$(c "$1" "https://$PUBLIC/realms/employee/protocol/openid-connect/auth?client_id=account-console&redirect_uri=https%3A%2F%2F$PUBLIC%2Frealms%2Femployee%2Faccount%2F&response_type=code&scope=openid&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256" || true)"
   form="$(tr '\n' ' ' <<<"$page" | grep -oE '<form[^>]*id="kc-form-login"[^>]*>' | grep -oE 'action="https://[^/"]+' | cut -d/ -f3 || true)"
-  same "$form" "$PUBLIC" "the company sign-in form posts to the public hostname"
+  same "$form" "$PUBLIC" "the employee sign-in form posts to the public hostname"
   css="$(grep -oE '/resources/[^"]+\.css' <<<"$page" | head -n 1 || true)"
   if [[ -n "$css" ]]; then expect "$1" 200 "https://$PUBLIC$css" "a stylesheet of that page"; else fail "the sign-in page names no stylesheet"; fi
 }
@@ -218,7 +218,7 @@ closed() {
   expect "$1" "$2" "https://$3/.well-known/oauth-authorization-server/realms/master" "master RFC 8414 discovery"
   expect "$1" "$2" "https://$3/realms/master/protocol/openid-connect/token" "master token endpoint"
   expect "$1" "$2" "https://$3/realms/customer/.well-known/openid-configuration" "a realm not listed (customer)"
-  expect "$1" "$2" "https://$3/realms/company-test/.well-known/openid-configuration" "a realm whose name starts like a listed one"
+  expect "$1" "$2" "https://$3/realms/employee-test/.well-known/openid-configuration" "a realm whose name starts like a listed one"
   expect "$1" "$2" "https://$3/admin/master/console/" "Admin Console"
   expect "$1" "$2" "https://$3/admin/realms" "Admin REST API"
   expect "$1" "$2" "https://$3/" "/"
@@ -238,7 +238,7 @@ case "$MODE" in
     ;;
 
   split)
-    echo "public $PUBLIC (realm company), admin $ADMIN for $ALLOWED_IPS"
+    echo "public $PUBLIC (realm employee), admin $ADMIN for $ALLOWED_IPS"
     client "$OK" "$TEST_ALLOWED_IP"
     client "$NO" "$TEST_DENIED_IP"
     kcadm_master_frontend ""
@@ -246,7 +246,7 @@ case "$MODE" in
     make_realms "$OK" "$ADMIN"
 
     echo "public hostname, from a source outside the allowlist:"
-    public_company "$NO"
+    public_employee "$NO"
     closed "$NO" 404 "$PUBLIC"
     echo "admin hostname, from a source outside the allowlist:"
     expect "$NO" 403 "https://$ADMIN/admin/master/console/" "Admin Console"
@@ -272,7 +272,7 @@ case "$MODE" in
     ;;
 
   one-host)
-    echo "one hostname $PUBLIC: realm company for everyone, the rest for $ALLOWED_IPS"
+    echo "one hostname $PUBLIC: realm employee for everyone, the rest for $ALLOWED_IPS"
     client "$OK" "$TEST_ALLOWED_IP"
     client "$NO" "$TEST_DENIED_IP"
     # A frontend URL left from a separate admin hostname would send the
@@ -282,7 +282,7 @@ case "$MODE" in
     make_realms "$OK" "$PUBLIC"
 
     echo "from a source outside the allowlist:"
-    public_company "$NO"
+    public_employee "$NO"
     closed "$NO" 403 "$PUBLIC"
     echo "from a source inside the allowlist:"
     expect "$OK" 200 "https://$PUBLIC/admin/master/console/" "Admin Console"
