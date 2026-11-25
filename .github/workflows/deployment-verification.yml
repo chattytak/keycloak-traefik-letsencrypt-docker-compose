@@ -477,3 +477,27 @@ jobs:
       - name: Shutdown Docker Compose services
         if: always()
         run: docker compose -f "$DOCKER_COMPOSE_FILE" -p "$COMPOSE_PROJECT_NAME" down
+
+  master-hardening:
+    # keycloak-init (KEYCLOAK_INIT_ENABLED): what it applies to the master
+    # realm, on throwaway stacks tests/master-hardening.sh brings up and tears
+    # down itself, each with its own env file. The traefik scenario needs
+    # ports 80 and 443, which nothing else in this job holds.
+    name: keycloak-init hardens the master realm
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 40
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Create necessary Docker networks
+        run: |
+          docker network create keycloak-network
+          docker network create traefik-network
+
+      - name: First start, next start, re-applying, every row off, the README examples, failures
+        run: ./tests/master-hardening.sh

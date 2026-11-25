@@ -14,6 +14,7 @@
   - [Typical use cases](#typical-use-cases)
 - [Supply chain trust](#supply-chain-trust)
 - [Admin hostname, public realms and an allowlist](#admin-hostname-public-realms-and-an-allowlist)
+- [Hardening the master realm at first start](#hardening-the-master-realm-at-first-start)
 - [Production checklist](#production-checklist)
 - [Backups](#backups)
 - [Restoring a database backup](#restoring-a-database-backup)
@@ -193,18 +194,106 @@ docker compose -f keycloak-traefik-letsencrypt-docker-compose.yml -p keycloak ex
   /opt/keycloak/bin/kcadm.sh update realms/master -s attributes.frontendUrl=https://keycloak-admin.example.com
 ```
 
-The first command asks for the password. The Admin Console is then at `https://keycloak-admin.example.com/admin/`, and `master` tokens carry the issuer `https://keycloak-admin.example.com/realms/master`: an application that signs in through `master` has to move to a realm of its own first, which Keycloak recommends anyway. To go back, clear the frontend URL first (`-s attributes.frontendUrl=`), then unset `KEYCLOAK_ADMIN_HOSTNAME`.
+The first command asks for the password. On a new deployment with `KEYCLOAK_INIT_ENABLED=true`, keycloak-init takes this step for you (see [Hardening the master realm at first start](#hardening-the-master-realm-at-first-start)). The Admin Console is then at `https://keycloak-admin.example.com/admin/`, and `master` tokens carry the issuer `https://keycloak-admin.example.com/realms/master`: an application that signs in through `master` has to move to a realm of its own first, which Keycloak recommends anyway. To go back, clear the frontend URL first (`-s attributes.frontendUrl=`), then unset `KEYCLOAK_ADMIN_HOSTNAME`.
 
 - Traefik checks the address a connection comes from. Behind a CDN or another proxy that is the proxy's address, and the allowlist needs Traefik's `ipStrategy` instead.
 - Two Traefik routers share the Keycloak service: `keycloak`, with the allowlist (the `keycloak-admin-allowlist` middleware), and `keycloak-public`. With nothing set `keycloak` serves every path, as before, so a middleware an override of yours attaches to it still covers everything. Once a public realm or an allowlist is set, `keycloak-public` serves the realm paths and your middleware no longer covers them; an override that sets the `keycloak` router's middlewares must keep `keycloak-admin-allowlist` in its list.
 - `/health` and `/metrics` stay off both hostnames: Keycloak serves them on its management port, which Traefik never reaches. `/lb-check` is not routed; it exists only with Keycloak's `stateless` or `multi-site` features, which this stack does not turn on.
 - Keycloak's own [issue #10655](https://github.com/keycloak/keycloak/issues/10655), still open, reports that impersonating a user from an Admin Console on a separate hostname does not carry over to the realm's hostname.
 
+## Hardening the master realm at first start
+
+This template puts Keycloak on the internet in a few commands, but Keycloak is not safe the moment it is deployed. A separate admin hostname ([above](#admin-hostname-public-realms-and-an-allowlist)) keeps the Admin Console and `master` off the public hostname, yet `master` itself keeps Keycloak's defaults, which its [Server Administration Guide](https://www.keycloak.org/docs/latest/server_admin/), "Mitigating security threats", warns about: brute force detection is off, there is no password policy, authorization codes live 60 seconds, events are not stored. And the bootstrap admin keeps the password from `.env`, in plain text, with no OTP. Without a separate admin hostname, all of this is on the public hostname.
+
+keycloak-init raises that baseline, so that a new deployment can face the internet from the start, without first learning Keycloak's settings. Set `KEYCLOAK_INIT_ENABLED=true` in `.env` **before the very first `docker compose up`**, and the one-shot `init` service applies these to `master`:
+
+| `.env` (each on unless `false`) | Setting | Source |
+|---|---|---|
+| `KEYCLOAK_ADMIN_HOSTNAME`, when set | `master` frontend URL, the step [above](#admin-hostname-public-realms-and-an-allowlist) | |
+| `KEYCLOAK_INIT_BRUTE_FORCE` | Brute force detection, temporary lockout only | Guide: Brute force attacks; [NIST SP 800-63B-4](https://pages.nist.gov/800-63-4/sp800-63b.html) Sec. 3.2.2 |
+| `KEYCLOAK_INIT_OTP_LOCKOUT` | Lockout after 100 failed OTP codes | Guide: Secondary Authentication Failures Lockout; NIST Sec. 3.2.2 |
+| `KEYCLOAK_INIT_PASSWORD_POLICY` | 15 to 64 characters, not the username or email, no composition rules | NIST Sec. 3.1.1.2 |
+| `KEYCLOAK_INIT_OTP_REQUIRED` | OTP setup required for every new user | Guide: Password policies; NIST AAL2 (Sec. 2.2.1) |
+| `KEYCLOAK_INIT_AUTH_CODE_LIFESPAN` | Authorization codes valid 9 seconds | Guide: Compromised authorization code |
+| `KEYCLOAK_INIT_PASSKEYS` | Sign-in with passkeys next to password and OTP | NIST AAL2, phishing-resistant option (Sec. 2.2.2, 3.2.5) |
+| `KEYCLOAK_INIT_OFFLINE_SESSION_MAX` | Offline sessions end 24 hours after sign-in | NIST AAL2 reauthentication (Sec. 2.2.3) |
+| `KEYCLOAK_INIT_EVENTS` | Login and admin events stored | NIST Sec. 4.1 |
+
+`KEYCLOAK_ADMIN_USERNAME` must then set a new password, and set up OTP, at its first sign-in, so `KEYCLOAK_ADMIN_PASSWORD` stops working: sign in right after the first start. The settings aim at NIST SP 800-63B-4 AAL2; they do not make a deployment compliant. Two of its requirements are left to you: a password blocklist and a notification when a user adds an authenticator, which needs SMTP. Other realms get nothing from the baseline. With a separate admin hostname, `master` is for administration only, so your applications need a realm of their own: `KEYCLOAK_INIT_EXTRA_COMMANDS` can create it in the same first start, as the first example below shows.
+
+How it runs:
+
+- On the very first start Keycloak creates a temporary service account, `temp-admin`. keycloak-init signs in with it, applies the settings with `kcadm.sh` and deletes it. Every later start finds no `temp-admin` and does nothing.
+- If a step fails, `temp-admin` stays, `docker compose up` reports the failure and Traefik does not start, so Keycloak stays off the network. Read `docker compose -p keycloak logs init`, fix `.env` and run `docker compose up -d` again. To stop there instead, delete `temp-admin` under Clients in the Admin Console.
+- To apply the settings again later, recreate `temp-admin` with Keycloak's recovery command, `bootstrap-admin service` (Keycloak guide: [Bootstrapping and recovering an admin account](https://www.keycloak.org/server/bootstrap-admin-recovery)), given the secret keycloak-init expects, then start the stack:
+
+  ```bash
+  docker compose -f keycloak-traefik-letsencrypt-docker-compose.yml -p keycloak stop keycloak
+  docker compose -f keycloak-traefik-letsencrypt-docker-compose.yml -p keycloak run --rm --no-deps keycloak \
+    bootstrap-admin service --client-secret:env KC_BOOTSTRAP_ADMIN_CLIENT_SECRET --no-prompt
+  docker compose -f keycloak-traefik-letsencrypt-docker-compose.yml -p keycloak up -d
+  ```
+
+  That command names its account `temp-admin` too, unless told otherwise, so keycloak-init knows its own by the secret: an account created for an ordinary recovery, with a secret of your own, is left alone.
+- `KEYCLOAK_INIT_EXTRA_COMMANDS` runs more `kcadm.sh` commands after the settings; see [the next section](#writing-keycloak_init_extra_commands).
+
+### Writing KEYCLOAK_INIT_EXTRA_COMMANDS
+
+- One command per line, without the leading `kcadm.sh`, in double quotes so the value can span lines. The commands run in order after the settings above, signed in as `temp-admin`.
+- Blank lines, indentation, lines starting with `#` and a `#` comment after a command are ignored.
+- Each line is read as a shell command line: put a value with spaces or parentheses in single quotes. `$KEYCLOAK_ADMIN_USERNAME` and `$(kcadm get ...)` work too, as in the last example below.
+- A failing line stops there, as any failing step does: `temp-admin` stays and Traefik does not start.
+
+```dotenv
+KEYCLOAK_INIT_EXTRA_COMMANDS="
+# A line starting with # is skipped, and so is a blank line.
+update realms/master -s 'displayName=Example admin'
+
+  # Indenting is fine, and so is a comment after a command.
+  update realms/master -s loginWithEmailAllowed=false   # usernames only
+# update realms/master -s registrationAllowed=true
+"
+```
+
+### Another realm at the same level
+
+This creates a realm with the same settings as `master` (names from the guide's "Creating a realm": `employee`, `customer`). Each line is one setting: comment it out to make the realm differ from `master`. Lines with two `-s` are pairs that only work together; change the value instead.
+
+```dotenv
+KEYCLOAK_INIT_EXTRA_COMMANDS="
+create realms -s realm=employee -s enabled=true
+update realms/employee -s bruteForceProtected=true
+update realms/employee -s permanentLockout=false
+update realms/employee -s maxSecondaryAuthFailures=100
+update realms/employee -s 'passwordPolicy=length(15) and maxLength(64) and notUsername and notEmail'
+update authentication/required-actions/CONFIGURE_TOTP -r employee -s enabled=true -s defaultAction=true
+update realms/employee -s accessCodeLifespan=9
+update realms/employee -s webAuthnPolicyPasswordlessPasskeysEnabled=true
+update realms/employee -s offlineSessionMaxLifespanEnabled=true -s offlineSessionMaxLifespan=86400
+update realms/employee -s eventsEnabled=true
+update realms/employee -s adminEventsEnabled=true
+"
+```
+
+### Removing the temporary-admin mark
+
+Keycloak marks the bootstrap admin as temporary and shows a warning for it in the Admin Console. Keycloak advises replacing that user because its credentials sit in the environment; with keycloak-init they stop working at the first sign-in, so a new user would differ only in its ID. If the warning bothers you, drop the mark itself. It is the user attribute `is_temporary_admin`, which is internal and undocumented: check this again after a Keycloak upgrade.
+
+```dotenv
+KEYCLOAK_INIT_EXTRA_COMMANDS="
+update users/profile -s unmanagedAttributePolicy=ADMIN_EDIT
+update users/$(kcadm get users -q username=$KEYCLOAK_ADMIN_USERNAME -q exact=true --fields id --format csv --noquotes) -s attributes={}
+update users/profile -d unmanagedAttributePolicy
+"
+```
+
+The first line lets an admin edit attributes the user profile does not declare, the second clears them, `is_temporary_admin` being the only one, and the third restores the default.
+
 ## Production checklist
 
 Before exposing this to real users, check every box:
 
-- [ ] **Rotate the bootstrap admin.** `KEYCLOAK_ADMIN_USERNAME`/`PASSWORD` create a single admin on first start. After login, create your real admin users (preferably via Keycloak Federation or a second-factor-protected account), then disable or delete the bootstrap admin from the Keycloak UI.
+- [ ] **Rotate the bootstrap admin.** `KEYCLOAK_ADMIN_USERNAME`/`PASSWORD` create a single admin on first start. After login, create your real admin users (preferably via Keycloak Federation or a second-factor-protected account), then disable or delete the bootstrap admin from the Keycloak UI. With `KEYCLOAK_INIT_ENABLED=true` its first sign-in already sets a new password and OTP; see [Hardening the master realm at first start](#hardening-the-master-realm-at-first-start).
 - [ ] **Strong secrets everywhere.** `KEYCLOAK_DB_PASSWORD` and `KEYCLOAK_ADMIN_PASSWORD` must be at least 24 random characters. Generate with `openssl rand -base64 24 | tr -d '/+=' | head -c 32`. Traefik dashboard BCrypt hash must be regenerated per deployment.
 - [ ] **Host-mount the backups volume.** By default the `backups` service writes to a named docker volume. For disaster recovery, bind-mount it to a host path that's included in your off-host backup solution: `- /srv/keycloak-postgres/backups:/srv/keycloak-postgres/backups`.
 - [ ] **Verify Let's Encrypt cert issuance.** Watch Traefik logs during first start: `docker compose -p keycloak logs traefik -f`. A successful TLS-ALPN challenge logs `Adding certificate for domain(s) ${KEYCLOAK_HOSTNAME}` within ~30 seconds.
@@ -314,6 +403,8 @@ The [Deployment Verification](https://github.com/heyvaldemar/keycloak-traefik-le
 7. **Prune removes old**: a fake file with 14-day-old mtime is deleted on the next prune cycle; recent backups are preserved.
 
 `tests/routing.sh` asks Traefik which requests reach Keycloak, by hostname, path and source address, from throwaway curl containers with known addresses. The deploy job runs it with nothing set: the Admin Console, discovery and the console's own sign-in on `KEYCLOAK_HOSTNAME`. The `split-routing` job runs it with a separate admin hostname, realm `company` public and an allowlist, then again on one hostname with the allowlist: what the public side serves and refuses (`master`, other realms, `company-test`, `/admin/`), 403 on the admin side from outside the allowlist, and the Admin Console sign-in from inside it, which first proves that it fails until the `master` frontend URL is set.
+
+`tests/master-hardening.sh` runs in the `master-hardening` job. It brings up throwaway stacks with `KEYCLOAK_INIT_ENABLED` set and checks the database after each: every setting applied on the first start, a no-op on the next start, re-applying, a plain recovery left alone, every setting off with the extra-commands syntax example, the realm and temporary-admin-mark examples above, a failure that keeps `temp-admin` and stops Traefik, and a stack with keycloak-init off that comes up as before.
 
 Run the same tests locally:
 
