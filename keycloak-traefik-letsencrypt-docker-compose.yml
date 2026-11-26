@@ -11,6 +11,71 @@ x-images:
   postgres: &postgres-image ${KEYCLOAK_POSTGRES_IMAGE_TAG:-postgres:${KEYCLOAK_POSTGRES_IMAGE_VERSION:-16@sha256:07abc3f43c9395b0bdbbab36bc25ddb0e8d83cd4fcafb5fb7d6abe14ff156dd8}}
   keycloak: &keycloak-image ${KEYCLOAK_IMAGE_TAG:-quay.io/keycloak/keycloak:${KEYCLOAK_IMAGE_VERSION:-26.8.2@sha256:7e66a96e4739239070aeaf72e4c5decf0f7f682cfc725b9f7ea2b336eaba38b3}}
 
+# keycloak-init's script ($$ is a literal $ for Compose).
+x-keycloak-init-script: &keycloak-init-script |
+  # Acts only when it can sign in as temp-admin (Keycloak creates it on the first
+  # start). Deletes temp-admin on success and keeps it on failure, so a fixed .env
+  # and `docker compose up` resume. README, "Hardening the master realm at first start".
+  set -euo pipefail
+  kcadm() { /opt/keycloak/bin/kcadm.sh "$$@" --config /tmp/kcadm.config; }
+  login() { kcadm config credentials --server http://keycloak:8080 --realm master \
+    --client temp-admin --secret "$$KC_BOOTSTRAP_ADMIN_CLIENT_SECRET"; }
+
+  [ -n "$$KEYCLOAK_INIT_ENABLED" ] || exit 0
+  # Waits here, not in depends_on, so that with init off Traefik need not wait.
+  for _ in {1..60}; do
+    (exec 3<>/dev/tcp/keycloak/9000 &&
+      printf 'GET /health/ready HTTP/1.1\r\nHost: keycloak\r\nConnection: close\r\n\r\n' >&3 &&
+      grep -q '200 OK' <&3) 2>/dev/null && break
+    sleep 5
+  done
+  if ! out=$$(login 2>&1); then
+    # kcadm exits 1 on any failure; the bracketed error code is OAuth 2.0's own
+    # (RFC 6749, Sec. 5.2): no such client or wrong secret means nothing to do.
+    grep -q '\[\(invalid_client\|unauthorized_client\)\]' <<<"$$out" && exit 0
+    echo "$$out" >&2; exit 1
+  fi
+  trap 'if [ $$? -eq 0 ]; then
+      kcadm delete "clients/$$(kcadm get clients -q clientId=temp-admin --fields id --format csv --noquotes)"
+    else
+      echo "[keycloak-init] FAILED. temp-admin, a full admin of the master realm, is STILL THERE." >&2
+      echo "[keycloak-init] Fix .env and run docker compose up again, or delete temp-admin (Clients) yourself." >&2
+    fi' EXIT
+  [ "$$KEYCLOAK_INIT_ENABLED" = true ] || exit 0
+
+  # Toggle, then kcadm arguments, in three groups: the README's frontendUrl step
+  # (a new issuer for master, so sign in again); the Keycloak Server Administration
+  # Guide (KC), "Mitigating security threats", in its order; NIST SP 800-63B-4 AAL2
+  # items the guide lacks, in NIST's order.
+  # KEYCLOAK_INIT_EXTRA_COMMANDS: more kcadm arguments, one command per line.
+  baseline=$$(cat <<'EOF'
+  KEYCLOAK_ADMIN_HOSTNAME           update realms/master -s attributes.frontendUrl=https://$$KEYCLOAK_ADMIN_HOSTNAME && login >/dev/null  # README: admin hostname
+
+  KEYCLOAK_INIT_BRUTE_FORCE         update realms/master -s bruteForceProtected=true  # KC: Brute force attacks; NIST 3.2.2 SHALL
+  KEYCLOAK_INIT_BRUTE_FORCE         update realms/master -s permanentLockout=false  # KC: Downside of brute force detection
+  KEYCLOAK_INIT_OTP_LOCKOUT         update realms/master -s maxSecondaryAuthFailures=100  # KC: Secondary auth failures lockout; NIST 3.2.2 SHALL
+  KEYCLOAK_INIT_PASSWORD_POLICY     update realms/master -s 'passwordPolicy=length(15) and maxLength(64) and notUsername and notEmail'  # NIST 3.1.1.2 SHALL (64: SHOULD)
+  KEYCLOAK_INIT_OTP_REQUIRED        update authentication/required-actions/CONFIGURE_TOTP -s enabled=true -s defaultAction=true  # KC: Password policies (OTP); NIST 2.2.1 SHALL
+  KEYCLOAK_INIT_AUTH_CODE_LIFESPAN  update realms/master -s accessCodeLifespan=9  # KC: Compromised authorization code
+
+  KEYCLOAK_INIT_PASSKEYS            update realms/master -s webAuthnPolicyPasswordlessPasskeysEnabled=true  # NIST 2.2.2 SHALL, 3.2.5
+  KEYCLOAK_INIT_OFFLINE_SESSION_MAX update realms/master -s offlineSessionMaxLifespanEnabled=true -s offlineSessionMaxLifespan=86400  # NIST 2.2.3 SHOULD
+  KEYCLOAK_INIT_EVENTS              update realms/master -s eventsEnabled=true  # NIST 4.1 SHALL
+  KEYCLOAK_INIT_EVENTS              update realms/master -s adminEventsEnabled=true  # NIST 4.1 SHALL
+  EOF
+  )
+  while read -r toggle args; do
+    [ -n "$${args%%#*}" ] && [ "$${!toggle:-false}" != false ] || continue  # blank or commented out
+    eval "kcadm $$args"
+  done < <(echo "$$baseline"; sed 's/^/KEYCLOAK_INIT_EXTRA_COMMANDS /' <<<"$$KEYCLOAK_INIT_EXTRA_COMMANDS")
+
+  # The bootstrap admin user's password sits in .env in plain text: it must set a
+  # new one (and OTP) at its first sign-in. Keycloak does not require either.
+  actions='"UPDATE_PASSWORD"'
+  [ "$$KEYCLOAK_INIT_OTP_REQUIRED" = false ] || actions+=',"CONFIGURE_TOTP"'
+  kcadm update "users/$$(kcadm get users -q username="$$KEYCLOAK_ADMIN_USERNAME" \
+    -q exact=true --fields id --format csv --noquotes)" -s "requiredActions=[$$actions]"
+
 networks:
   keycloak-network:
     external: true
@@ -91,6 +156,11 @@ services:
       KC_DB_SCHEMA: public
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME:?set in .env - see .env.example}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in .env - see .env.example for generation command}
+      # The keycloak-init service account (temp-admin), shared with keycloak-init.
+      # Empty, as when KEYCLOAK_INIT_ENABLED is unset, Keycloak creates none;
+      # set, it creates one on the very first start only. The suffix keeps it
+      # from matching a secret someone picks for a manual recovery account.
+      KC_BOOTSTRAP_ADMIN_CLIENT_SECRET: &keycloak-init-secret "${KEYCLOAK_INIT_ENABLED:+${KEYCLOAK_DB_PASSWORD}.keycloak-init}"
       KC_HEALTH_ENABLED: 'true'
       # With KEYCLOAK_ADMIN_HOSTNAME unset both lines are what they always were:
       # the plain hostname, and no admin hostname. Set, Keycloak requires the
@@ -151,8 +221,8 @@ services:
       - "traefik.http.routers.keycloak.middlewares=keycloak-admin-allowlist,compresstraefik"
       - "traefik.http.middlewares.keycloak-admin-allowlist.ipallowlist.sourcerange=${KEYCLOAK_ADMIN_ALLOWED_IPS:-0.0.0.0/0,::/0}"
       # The public router. $$ is a literal $ for Traefik: a realm name ends at
-      # a slash or at the end of the path, so `company` never matches
-      # `company-test`.
+      # a slash or at the end of the path, so `employee` never matches
+      # `employee-test`.
       - "traefik.http.routers.keycloak-public.rule=Host(`${KEYCLOAK_HOSTNAME}`) && (PathPrefix(`/resources/`) || PathRegexp(`^/([.]well-known/[^/]+/)?realms/(${KEYCLOAK_PUBLIC_REALMS:-[^/]+})(/|$$)`))"
       - "traefik.http.routers.keycloak-public.service=keycloak"
       - "traefik.http.routers.keycloak-public.entrypoints=websecure"
@@ -202,6 +272,58 @@ services:
         reservations:
           memory: ${KEYCLOAK_MEMORY_RESERVATION:-256m}
           cpus: "${KEYCLOAK_CPU_RESERVATION:-0.5}"
+
+  # Runs x-keycloak-init-script (top of this file). Applies nothing unless
+  # KEYCLOAK_INIT_ENABLED=true.
+  init:
+    image: *keycloak-image
+    entrypoint: ["/bin/bash", "-c", *keycloak-init-script, "keycloak-init"]
+    # Defaults live here; .env.example, "Optional: harden the master realm at
+    # first start", explains each one and how to turn it off.
+    environment:
+      KEYCLOAK_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USERNAME}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_BOOTSTRAP_ADMIN_CLIENT_SECRET: *keycloak-init-secret
+      KEYCLOAK_INIT_ENABLED: ${KEYCLOAK_INIT_ENABLED:-}
+      KEYCLOAK_ADMIN_HOSTNAME: ${KEYCLOAK_ADMIN_HOSTNAME:-}
+      KEYCLOAK_INIT_BRUTE_FORCE: ${KEYCLOAK_INIT_BRUTE_FORCE:-true}
+      KEYCLOAK_INIT_OTP_LOCKOUT: ${KEYCLOAK_INIT_OTP_LOCKOUT:-true}
+      KEYCLOAK_INIT_PASSWORD_POLICY: ${KEYCLOAK_INIT_PASSWORD_POLICY:-true}
+      KEYCLOAK_INIT_OTP_REQUIRED: ${KEYCLOAK_INIT_OTP_REQUIRED:-true}
+      KEYCLOAK_INIT_AUTH_CODE_LIFESPAN: ${KEYCLOAK_INIT_AUTH_CODE_LIFESPAN:-true}
+      KEYCLOAK_INIT_PASSKEYS: ${KEYCLOAK_INIT_PASSKEYS:-true}
+      KEYCLOAK_INIT_OFFLINE_SESSION_MAX: ${KEYCLOAK_INIT_OFFLINE_SESSION_MAX:-true}
+      KEYCLOAK_INIT_EVENTS: ${KEYCLOAK_INIT_EVENTS:-true}
+      KEYCLOAK_INIT_EXTRA_COMMANDS: ${KEYCLOAK_INIT_EXTRA_COMMANDS:-}
+    networks:
+      - keycloak-network
+    depends_on:
+      keycloak:
+        condition: service_started
+    # Phase 7 hardening (self-host-repo-hardening-runbook RUNBOOK.md → Phase 7).
+    # Same image and uid=1000 gid=0 as keycloak, but only kcadm.sh runs here: no
+    # `kc.sh build`, and its one written file is /tmp/kcadm.config, so read_only
+    # with /tmp tmpfs works. One-shot: no restart policy, no healthcheck;
+    # observability is via `docker compose logs init`.
+    user: "1000:0"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    # Resource limits are interpolation defaults like the image pins:
+    # override any of them in .env (e.g. KEYCLOAK_INIT_MEMORY_LIMIT=1g) and the
+    # override survives every git pull / compose-file replacement.
+    deploy:
+      resources:
+        limits:
+          memory: ${KEYCLOAK_INIT_MEMORY_LIMIT:-512m}
+          cpus: "${KEYCLOAK_INIT_CPU_LIMIT:-1.0}"
+        reservations:
+          memory: ${KEYCLOAK_INIT_MEMORY_RESERVATION:-128m}
+          cpus: "${KEYCLOAK_INIT_CPU_RESERVATION:-0.25}"
 
   traefik:
     image: *traefik-image
@@ -278,6 +400,13 @@ services:
       - "traefik.http.services.dashboard.loadbalancer.server.port=8080"
       # Pass the original Host header to the backend
       - "traefik.http.services.dashboard.loadbalancer.passhostheader=true"
+    # Starts only after keycloak-init succeeds. A failed init keeps temp-admin,
+    # a full admin, so `docker compose up` fails and Keycloak stays off the
+    # network until it is fixed. With KEYCLOAK_INIT_ENABLED unset, init exits
+    # at once.
+    depends_on:
+      init:
+        condition: service_completed_successfully
     restart: unless-stopped
     # Phase 7 hardening (self-host-repo-hardening-runbook RUNBOOK.md → Phase 7).
     # Traefik runs as root by default (the upstream image has no non-root user).
